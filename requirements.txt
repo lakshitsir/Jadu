@@ -1,0 +1,6 @@
+flask
+pyrogram==2.0.106
+tgcrypto
+aiofiles
+python-dotenv
+ffmpeg-python
