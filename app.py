@@ -1,267 +1,299 @@
-#!/usr/bin/env python3
-# Neon Compressor Bot — Ultra Aesthetic + AI Output Prediction Edition
-# Clean Edition: No Owner Logs
-
 import os
 import asyncio
 import subprocess
+import math
 import uuid
 from pathlib import Path
 from typing import Dict
 
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
+# ---------------------------
+# CONFIG (replace these)
+# ---------------------------
+API_ID = 12767104              # 
+API_HASH = "a0ce1daccf78234927eb68a62f894b97"     # 
+BOT_TOKEN = "8449049312:AAF48rvDz7tl2bK9dC7R63OSO6u4_xh-_t8"   # 
 
-# ------------------------------------
-# CONFIG
-# ------------------------------------
-API_ID = 12767104
-API_HASH = "a0ce1daccf78234927eb68a62f894b97"
-BOT_TOKEN = "8534652934:AAGGennPghtSmEJH31P-fl0w8oaGAspTLlc"
+# Performance tuning
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))  # number of parallel compress jobs
+DOWNLOAD_CHUNK = 1024 * 1024  # chunk size for progress calcs (used for UI math)
+FFMPEG_PRESET = os.getenv("FFMPEG_PRESET", "veryfast")  # faster: ultrafast | veryfast | faster | medium
+CRF = os.getenv("CRF", "28")  # quality (lower -> better size), 28 recommended for ~90% quality
 
-CRF = 28                 # ~90% HQ Quality
-FFMPEG_PRESET = "faster" # Fast compression
-MAX_CONCURRENT_JOBS = 2
+# Working directories
+TMP_DIR = Path(os.getenv("TMP_DIR", "neon_tmp")).resolve()
+TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-TMP_DIR = Path("neon_tmp")
-TMP_DIR.mkdir(exist_ok=True)
-
+# Pyrogram client
 app = Client(
-    "neon_ultra_ai_compressor",
+    "neon_concurrent_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
 )
 
+# Semaphore to limit concurrent jobs
 job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-job_meta: Dict[str, dict] = {}
-running_jobs: Dict[str, asyncio.Task] = {}
 
+# Track running tasks and metadata
+running_jobs: Dict[str, asyncio.Task] = {}  # job_id -> task
+job_meta: Dict[str, dict] = {}  # job_id -> {user_id, chat_id, orig_name, sizes...}
 
-# ------------------------------------
-# UI HELPERS
-# ------------------------------------
+# UI templates (neon style)
+START_TEXT = """🔮 𝗡𝗲𝗼𝗻 𝗛𝗤 𝗖𝗼𝗺𝗽𝗿𝗲𝘀𝘀𝗼𝗿 — Online ⚡
 
-def human_mb(n: int):
-    return n / (1024 * 1024)
+Send any video/file and I'll ask before compressing.
+You can process multiple files — I handle them concurrently.
 
-def bar(percent):
-    filled = int(percent / 100 * 18)
-    empty = 18 - filled
-    return "▰" * filled + "▱" * empty
+Developer: @lakshitpatidar
+"""
 
-async def update_ui(pm, phase, current, total, user):
-    percent = (current / total * 100) if total else 0
-    ui = (
-        f"✨ <b>{phase}</b> — {percent:.1f}%\n"
-        f"<code>{bar(percent)}</code>\n"
-        f"{human_mb(current):.2f} MB / {human_mb(total):.2f} MB\n"
-        f"👤 {user}"
-    )
+MEDIA_PROMPT_TEXT = """🔔 Media detected!
 
-    now = asyncio.get_event_loop().time()
-    if not hasattr(update_ui, "t"):
-        update_ui.t = 0
+File: {name}
+Size: {size_mb:.2f} MB
 
-    if now - update_ui.t < 0.8:
-        return
+Should I compress this file now?
+(Mode: HEVC • ~90% quality)
+"""
 
-    update_ui.t = now
+PROGRESS_TEMPLATE = "⏳ {phase} — {percent:.1f}%\n{done_mb:.2f} MB / {total_mb:.2f} MB"
 
-    try:
-        await pm.edit(ui)
-    except:
-        pass
+DONE_TEXT = """✅ Compression finished!
+Original: {orig_mb:.2f} MB
+Compressed: {new_mb:.2f} MB
+Saved: {saved:.1f}%
+"""
 
-
-# ------------------------------------
-# AI OUTPUT SIZE PREDICTION
-# ------------------------------------
-
-def ai_predict_size(input_bytes: int):
-    """
-    Predict compressed size using HEVC expected compression ratio.
-    """
-    # 65% reduction approx (safe middle value)
-    predicted = input_bytes * 0.35
-    return predicted
-
-
-# ------------------------------------
-# FFMPEG COMPRESSOR
-# ------------------------------------
-
-def ffmpeg_compress(src, out):
-    cmd = [
-        "ffmpeg","-y",
-        "-i",src,
-        "-vcodec","libx265",
-        "-crf",str(CRF),
-        "-preset",FFMPEG_PRESET,
-        "-acodec","aac",
-        "-b:a","96k",
-        out
+# Inline keyboard
+PROMPT_KBD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("✅ Yes — Compress", callback_data="compress_yes")],
+        [InlineKeyboardButton("❌ No — Skip", callback_data="compress_no")],
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+)
 
+# Helper functions
+def human_mb(n_bytes: int) -> float:
+    return n_bytes / (1024 * 1024)
 
-# ------------------------------------
-# DOWNLOAD / UPLOAD
-# ------------------------------------
+def ffmpeg_compress(input_path: str, output_path: str) -> None:
+    """
+    Blocking call: run ffmpeg to compress video with libx265.
+    This runs in a threadpool to avoid blocking asyncio loop.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-vcodec", "libx265",
+        "-crf", str(CRF),
+        "-preset", FFMPEG_PRESET,
+        "-acodec", "aac",
+        "-b:a", "96k",
+        str(output_path)
+    ]
+    # Run and let ffmpeg print to stdout/stderr (useful for debugging)
+    subprocess.run(cmd, check=False)
 
-async def download(client, msg, dest, pm, user):
-    async def cb(cur, total):
-        await update_ui(pm, "Downloading", cur, total, user)
-    return Path(await client.download_media(msg, file_name=str(dest), progress=cb))
+async def download_with_progress(client: Client, message: Message, dest: Path, progress_msg: Message, phase_label: str="Downloading"):
+    """
+    Download media and update progress message.
+    Uses pyrogram's download_media with its progress callback.
+    """
+    total = 0
+    last_edit_ts = 0
 
+    def _progress(current, total_bytes):
+        nonlocal total, last_edit_ts
+        total = total_bytes
+        # update every ~0.8s to avoid rate limits
+        now = asyncio.get_event_loop().time()
+        if now - last_edit_ts < 0.8:
+            return
+        last_edit_ts = now
+        percent = (current / total_bytes) * 100 if total_bytes else 0.0
+        asyncio.create_task(progress_msg.edit(PROGRESS_TEMPLATE.format(
+            phase=phase_label, percent=percent,
+            done_mb=human_mb(current), total_mb=human_mb(total_bytes)
+        )))
 
-async def upload(client, chat, file, caption, pm, user):
-    async def cb(cur, total):
-        await update_ui(pm, "Uploading", cur, total, user)
-    await client.send_document(chat, str(file), caption=caption, progress=cb)
+    # call pyrogram download_media (this is blocking await but has internal streaming)
+    path = await client.download_media(message=message, file_name=str(dest), progress=_progress, progress_args=None)
+    # final update
+    await progress_msg.edit(PROGRESS_TEMPLATE.format(
+        phase=phase_label, percent=100.0,
+        done_mb=human_mb(total), total_mb=human_mb(total)
+    ))
+    return Path(path)
 
+async def upload_with_progress(client: Client, chat_id: int, file_path: Path, caption: str, progress_msg: Message, phase_label: str="Uploading"):
+    """
+    Upload file with progress; uses pyrogram send_document progress callback.
+    """
+    total = file_path.stat().st_size
+    last_edit_ts = 0
 
-# ------------------------------------
-# PROCESS JOB
-# ------------------------------------
+    async def _progress(current, total_bytes):
+        nonlocal last_edit_ts
+        now = asyncio.get_event_loop().time()
+        if now - last_edit_ts < 0.8:
+            return
+        last_edit_ts = now
+        percent = (current / total_bytes) * 100 if total_bytes else 0.0
+        await progress_msg.edit(PROGRESS_TEMPLATE.format(
+            phase=phase_label, percent=percent,
+            done_mb=human_mb(current), total_mb=human_mb(total_bytes)
+        ))
 
+    await client.send_document(chat_id=chat_id, document=str(file_path), caption=caption, progress=_progress, progress_args=None)
+    await progress_msg.edit(PROGRESS_TEMPLATE.format(
+        phase=phase_label, percent=100.0,
+        done_mb=human_mb(total), total_mb=human_mb(total)
+    ))
+
+# Job worker
 async def process_job(client: Client, job_id: str):
-
-    meta = job_meta[job_id]
-    chat = meta["chat"]
-    user = meta["user"]
-    filename = meta["filename"]
-
-    pm = await client.send_message(chat, f"🔧 <b>Preparing…</b>\n👤 {user}")
-
-    async with job_semaphore:
-
-        tmp_in = TMP_DIR / f"{job_id}_in"
-        tmp_out = TMP_DIR / f"{job_id}.mp4"
-
-        try:
-            # DOWNLOAD
-            f = await download(client, meta["msg"], tmp_in, pm, user)
-            orig = f.stat().st_size
-
-            # COMPRESS
-            await pm.edit("⚙️ <b>Compressing…</b>")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, ffmpeg_compress, str(f), str(tmp_out))
-
-            # UPLOAD
-            new = tmp_out.stat().st_size
-            saved = 100 - (new / orig * 100)
-
-            caption = (
-                f"🎥 <b>{filename}</b>\n"
-                f"Saved: {saved:.1f}%\n"
-                f"👤 {user}"
-            )
-
-            await upload(client, chat, tmp_out, caption, pm, user)
-
-            await pm.edit(
-                f"✅ <b>Done!</b>\n"
-                f"Original: {human_mb(orig):.2f} MB\n"
-                f"Compressed: {human_mb(new):.2f} MB\n"
-                f"Saved: {saved:.1f}%"
-            )
-
-        finally:
-            for p in [tmp_in, tmp_out]:
-                try: p.unlink()
-                except: pass
-
-            job_meta.pop(job_id, None)
-            running_jobs.pop(job_id, None)
-
-
-# ------------------------------------
-# MEDIA DETECTION + CONFIRMATION (WITH AI PREDICTION)
-# ------------------------------------
-
-kbd = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✔ Yes — Compress", callback_data="yes")],
-    [InlineKeyboardButton("✖ No — Cancel", callback_data="no")]
-])
-
-@app.on_message((filters.video | filters.document | filters.audio | filters.photo))
-async def detect(client: Client, msg: Message):
-
-    if not msg.from_user:
+    meta = job_meta.get(job_id)
+    if not meta:
         return
+    chat_id = meta["chat_id"]
+    user_id = meta["user_id"]
+    orig_name = meta["orig_name"]
+    incoming_msg_id = meta["incoming_msg_id"]
 
-    user = f"@{msg.from_user.username}" if msg.from_user.username else f"user_{msg.from_user.id}"
+    # Acquire semaphore (limit concurrent compress jobs)
+    async with job_semaphore:
+        progress_msg = await client.send_message(chat_id, f"🎛️ Job started: {orig_name}")
+        try:
+            # Step 1: download
+            tmp_in = TMP_DIR / f"{job_id}_in"
+            await progress_msg.edit("📥 Preparing download...")
+            downloaded_path = await download_with_progress(client, meta["message_obj"], tmp_in, progress_msg, phase_label="Downloading")
 
-    filename = (
-        msg.document.file_name if msg.document else
-        msg.video.file_name if msg.video else
-        msg.audio.file_name if msg.audio else
-        "photo.jpg"
-    )
+            orig_size = downloaded_path.stat().st_size
+            meta["orig_size"] = orig_size
 
-    size = (
-        msg.document.file_size if msg.document else
-        msg.video.file_size if msg.video else
-        msg.audio.file_size if msg.audio else
-        0
-    )
+            # Step 2: compress (run in executor to avoid blocking)
+            await progress_msg.edit("⚙️ Compressing (fast HEVC)...")
+            tmp_out = TMP_DIR / f"{job_id}_out.mp4"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, ffmpeg_compress, str(downloaded_path), str(tmp_out))
 
-    predicted = ai_predict_size(size)
+            # Step 3: upload
+            await progress_msg.edit("📤 Uploading compressed file...")
+            new_size = tmp_out.stat().st_size
+            caption = f"🎥 Compressed: {orig_name}\nSaved: {100 - (new_size / orig_size * 100):.1f}% (approx)\nMode: HEVC • ~90% quality"
+            await upload_with_progress(client, chat_id, tmp_out, caption, progress_msg, phase_label="Uploading")
 
-    prompt = (
-        f"🎬 <b>Media Detected</b>\n\n"
-        f"📄 <b>{filename}</b>\n"
-        f"📦 {human_mb(size):.2f} MB\n\n"
-        f"🤖 <b>AI Estimate</b>:\n"
-        f"📉 Expected Output: ~{human_mb(predicted):.2f} MB\n\n"
-        f"👤 {user}\n\n"
-        f"<b>Compress this file?</b>"
-    )
+            # Step 4: final edit
+            await progress_msg.edit(DONE_TEXT.format(orig_mb=human_mb(orig_size), new_mb=human_mb(new_size), saved=(100 - (new_size / orig_size * 100))))
 
-    sent = await msg.reply(prompt, reply_markup=kbd)
+        except Exception as e:
+            await progress_msg.edit(f"❌ Error: {e}")
+        finally:
+            # cleanup files if exist
+            try:
+                for p in [tmp_in, tmp_out]:
+                    if p.exists():
+                        p.unlink()
+            except Exception:
+                pass
+            # remove job from running_jobs
+            running_jobs.pop(job_id, None)
+            job_meta.pop(job_id, None)
 
-    job_meta[f"p{sent.message_id}"] = {
-        "msg": msg,
-        "chat": msg.chat.id,
-        "filename": filename,
-        "user": user
+# Handlers: start
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(client: Client, message: Message):
+    await message.reply(START_TEXT)
+
+# When media is detected, prompt user with Yes / No
+@app.on_message(filters.private & (filters.video | filters.document | filters.audio | filters.photo))
+async def media_detected(client: Client, message: Message):
+    # If user sent multiple media in one message (album), pyrogram may handle each individually
+    name = (message.document.file_name if message.document else
+            (message.video.file_name if message.video else
+             (message.audio.file_name if message.audio else "photo.jpg")))
+    size = message.document.file_size if message.document else (message.video.file_size if message.video else (message.audio.file_size if message.audio else 0))
+    # Prepare prompt
+    prompt_text = MEDIA_PROMPT_TEXT.format(name=name, size_mb=human_mb(size))
+    # Send prompt with inline buttons
+    sent = await message.reply(prompt_text, reply_markup=PROMPT_KBD)
+    # store mapping from message id to original message object for callback lookup
+    # Save minimal meta to check later
+    # We'll attach message_obj to job meta later when user presses Yes
+    # Temporarily save pointer in job_meta keyed by the prompt message id
+    job_meta_key = f"prompt_{sent.message_id}"
+    job_meta[job_meta_key] = {
+        "origin_msg": message,
+        "prompt_msg_id": sent.message_id,
+        "chat_id": message.chat.id,
+        "user_id": message.from_user.id,
+        "name": name,
+        "size": size
     }
 
-
-# ------------------------------------
-# CALLBACK HANDLER
-# ------------------------------------
-
-@app.on_callback_query(filters.regex("yes|no"))
-async def callback(client: Client, q: CallbackQuery):
-
-    key = f"p{q.message.message_id}"
-
-    if key not in job_meta:
-        await q.message.edit("⚠️ Expired.")
+# Callback for Yes / No
+@app.on_callback_query(filters.regex(r"compress_(yes|no)"))
+async def on_prompt_answer(client: Client, callback_query):
+    action = callback_query.data.split("_")[1]  # yes or no
+    prompt_msg = callback_query.message
+    user = callback_query.from_user
+    # find job_meta entry by prompt_msg_id
+    key = f"prompt_{prompt_msg.message_id}"
+    meta = job_meta.get(key)
+    if not meta:
+        await prompt_msg.edit("⚠️ This prompt expired or is invalid.")
         return
-
-    if q.data == "no":
-        await q.message.edit("❌ Cancelled.")
+    orig_msg = meta["origin_msg"]
+    if action == "no":
+        await prompt_msg.edit("❌ Skipped compression.")
+        # cleanup prompt meta
         job_meta.pop(key, None)
         return
 
-    # YES
-    meta = job_meta.pop(key)
-    job_id = uuid.uuid4().hex[:8]
-    job_meta[job_id] = meta
+    # action == yes -> create a job
+    await prompt_msg.edit("✅ Compression queued. You will receive progress updates here.")
+    # create job id
+    job_id = str(uuid.uuid4())[:8]
+    job_meta[job_id] = {
+        "chat_id": meta["chat_id"],
+        "user_id": meta["user_id"],
+        "orig_name": meta["name"],
+        "incoming_msg_id": orig_msg.message_id,
+        "message_obj": orig_msg  # keep the original message object for download
+    }
+    # remove prompt meta
+    job_meta.pop(key, None)
 
-    running_jobs[job_id] = asyncio.create_task(process_job(client, job_id))
+    # start job task and track
+    task = asyncio.create_task(process_job(client, job_id))
+    running_jobs[job_id] = task
+    await callback_query.answer("Queued ✅", show_alert=False)
 
-    await q.message.edit("✨ Queued!")
+# Admin /status command to see active jobs
+@app.on_message(filters.command("status") & filters.private)
+async def status_cmd(client: Client, message: Message):
+    lines = [f"Max parallel jobs: {MAX_CONCURRENT_JOBS}"]
+    lines.append(f"Running jobs: {len(running_jobs)}")
+    for jid, t in running_jobs.items():
+        lines.append(f"- {jid} state: {t._state}")
+    await message.reply("\n".join(lines))
 
+# Graceful shutdown handler
+async def _shutdown():
+    # cancel all running tasks
+    for jid, t in list(running_jobs.items()):
+        if not t.done():
+            t.cancel()
+    await asyncio.sleep(0.2)
 
-# ------------------------------------
-# RUN BOT
-# ------------------------------------
+# run the bot
 if __name__ == "__main__":
-    print("🔥 Neon AI Compressor Started (Ultra Aesthetic Edition)")
-    app.run()
+    print("🔥 Neon Concurrent Compressor Bot starting...")
+    try:
+        app.run()
+    finally:
+        asyncio.run(_shutdown())
