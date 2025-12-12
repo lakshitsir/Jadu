@@ -18,7 +18,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, 
 # ------------------------------------
 API_ID = 12767104
 API_HASH = "a0ce1daccf78234927eb68a62f894b97"
-BOT_TOKEN = "8449049312:AAF48rvDz7tl2bK9dC7R63OSO6u4_xh-_t8"
+BOT_TOKEN = "8534652934:AAGGennPghtSmEJH31P-fl0w8oaGAspTLlc"
 
 CRF = 28                 # ~90% HQ Quality
 FFMPEG_PRESET = "faster" # Fast compression
