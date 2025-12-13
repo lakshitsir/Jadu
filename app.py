@@ -1,219 +1,146 @@
 import os
 import asyncio
 import subprocess
-import uuid
-from pathlib import Path
-from typing import Dict
-
+from collections import deque
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
-# ------------------------
-# MANUAL CONFIG
-# ------------------------
+# ================= CONFIG =================
 API_ID = 12767104
 API_HASH = "a0ce1daccf78234927eb68a62f894b97"
 BOT_TOKEN = "8449049312:AAF48rvDz7tl2bK9dC7R63OSO6u4_xh-_t8"
 
-# Compression settings
-MAX_CONCURRENT_JOBS = 1
-FFMPEG_PRESET = "veryfast"
-CRF = "28"
+DEV_TAG = "@lakshitpatidar"
 
-# Temp folder
-TMP_DIR = Path("neon_tmp").resolve()
-TMP_DIR.mkdir(exist_ok=True)
+WORKDIR = "work"
+os.makedirs(WORKDIR, exist_ok=True)
 
-# IMPORTANT FIX → rename client variable
-bot = Client(
-    "neon_fixed_compressor",
+app = Client(
+    "neo_compress_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# Job control
-job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-job_meta: Dict[str, dict] = {}
-running_jobs: Dict[str, asyncio.Task] = {}
+# ================= UI =================
+def ui(status, user):
+    return (
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "🎬 NEO VIDEO COMPRESSOR\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Request by {user}\n\n"
+        f"{status}\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"Dev - {DEV_TAG}"
+    )
 
-START_TEXT = "🔥 Neon HQ Compressor Online\nSend any video!"
+# ================= SAFE EDIT =================
+LAST_EDIT = {}
+async def safe_edit(msg, text):
+    now = asyncio.get_event_loop().time()
+    mid = msg.id
+    if mid in LAST_EDIT and now - LAST_EDIT[mid] < 1.2:
+        await asyncio.sleep(1.2)
+    try:
+        await msg.edit(text)
+        LAST_EDIT[mid] = asyncio.get_event_loop().time()
+    except:
+        pass
 
-PROMPT_KBD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("YES", callback_data="comp_yes")],
-    [InlineKeyboardButton("NO", callback_data="comp_no")]
-])
+# ================= AUTO QUALITY =================
+def auto_params(size_mb: float):
+    if size_mb > 2000:
+        return 33, "1200k"
+    elif size_mb >= 1500:
+        return 32, "1400k"
+    elif size_mb >= 500:
+        return 30, "1800k"
+    elif size_mb >= 200:
+        return 28, "2200k"
+    else:
+        return 26, "2500k"
 
+# ================= QUEUE =================
+QUEUE = deque()
+PROCESSING = False
 
-# ------------------------
-# Helper functions
-# ------------------------
-
-def human(x):
-    return x / (1024 * 1024)
-
-
-def ffmpeg_compress(i, o):
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", i,
-        "-vcodec", "libx265",
-        "-crf", CRF,
-        "-preset", FFMPEG_PRESET,
-        "-acodec", "aac",
-        "-b:a", "96k",
-        o
-    ])
-
-
-async def download_with_progress(client, msg, dest, edit_msg):
-    last = 0
-
-    def cb(cur, tot):
-        nonlocal last
-        now = asyncio.get_event_loop().time()
-        if now - last >= 1:
-            last = now
-            percent = cur / tot * 100
-            asyncio.create_task(
-                edit_msg.edit(f"⬇️ Downloading {percent:.1f}%\n{human(cur):.2f}/{human(tot):.2f} MB")
-            )
-
-    await client.download_media(msg, file_name=str(dest), progress=cb)
-    return dest
-
-
-async def upload_with_progress(client, chat_id, path, caption, edit_msg):
-    total = path.stat().st_size
-    last = 0
-
-    async def cb(cur, tot):
-        nonlocal last
-        now = asyncio.get_event_loop().time()
-        if now - last >= 1:
-            last = now
-            percent = cur / tot * 100
-            await edit_msg.edit(
-                f"⬆️ Uploading {percent:.1f}%\n{human(cur):.2f}/{human(tot):.2f} MB"
-            )
-
-    await client.send_document(chat_id, document=str(path), caption=caption, progress=cb)
-
-
-# ------------------------
-# Processing worker
-# ------------------------
-
-async def process_job(client, jid):
-    meta = job_meta[jid]
-
-    chat_id = meta["chat_id"]
-    name = meta["name"]
-    msg_obj = meta["msg_obj"]
-
-    async with job_semaphore:
-        status = await client.send_message(chat_id, f"🎛 Starting: {name}")
-
-        try:
-            temp_in = TMP_DIR / f"{jid}_in"
-            temp_out = TMP_DIR / f"{jid}_out.mp4"
-
-            downloaded = await download_with_progress(client, msg_obj, temp_in, status)
-            orig = downloaded.stat().st_size
-
-            await status.edit("⚙️ Compressing…")
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, ffmpeg_compress, str(downloaded), str(temp_out))
-
-            new = temp_out.stat().st_size
-
-            caption = f"🎥 Compressed: {name}\nSaved: {100 - (new/orig*100):.1f}%"
-            await upload_with_progress(client, chat_id, temp_out, caption, status)
-
-            await status.edit(
-                f"✅ Done!\nOriginal: {human(orig):.2f} MB\nNew: {human(new):.2f} MB"
-            )
-
-        except Exception as e:
-            await status.edit(f"❌ Error: {e}")
-
-        finally:
-            try:
-                if temp_in.exists(): temp_in.unlink()
-                if temp_out.exists(): temp_out.unlink()
-            except:
-                pass
-
-            job_meta.pop(jid, None)
-            running_jobs.pop(jid, None)
-
-
-# ------------------------
-# Handlers
-# ------------------------
-
-@bot.on_message(filters.command("start"))
+# ================= START =================
+@app.on_message(filters.command("start"))
 async def start(_, m):
-    await m.reply(START_TEXT)
-
-
-@bot.on_message(filters.private & (filters.video | filters.document))
-async def media_detect(_, m):
-
-    name = (
-        m.document.file_name if m.document else
-        m.video.file_name
+    await m.reply(
+        "🎬 Neo Video Compressor\n\n"
+        "Send video → auto compress\n"
+        "Smart quality selection\n\n"
+        f"Dev - {DEV_TAG}"
     )
 
-    size = (
-        m.document.file_size if m.document else
-        m.video.file_size
-    )
+# ================= VIDEO =================
+@app.on_message(filters.video)
+async def video_in(_, m):
+    global PROCESSING
 
-    prompt = await m.reply(
-        f"📁 {name}\nSize: {human(size):.2f} MB\n\nCompress?",
-        reply_markup=PROMPT_KBD
-    )
+    user = f"@{m.from_user.username}" if m.from_user and m.from_user.username else "User"
+    status = await m.reply(ui("Added to queue…", user))
 
-    job_meta[f"prompt_{prompt.id}"] = {
-        "chat_id": m.chat.id,
-        "name": name,
-        "msg_obj": m
-    }
+    inp = f"{WORKDIR}/{m.id}.mp4"
+    await m.download(file_name=inp)
 
+    size_mb = m.video.file_size / (1024 * 1024)
+    crf, maxrate = auto_params(size_mb)
 
-@bot.on_callback_query(filters.regex("comp_(yes|no)"))
-async def cb_handler(client, cq):
-    msg = cq.message
-    key = f"prompt_{msg.id}"
+    QUEUE.append({
+        "chat": m.chat.id,
+        "msg": status,
+        "inp": inp,
+        "user": user,
+        "crf": crf,
+        "maxrate": maxrate
+    })
 
-    if key not in job_meta:
-        await msg.edit("⚠️ Expired.")
-        return
+    if not PROCESSING:
+        PROCESSING = True
+        asyncio.create_task(process_queue())
 
-    meta = job_meta[key]
+# ================= PROCESS =================
+async def process_queue():
+    global PROCESSING
 
-    if cq.data == "comp_no":
-        await msg.edit("❌ Skipped.")
-        job_meta.pop(key, None)
-        return
+    while QUEUE:
+        job = QUEUE.popleft()
 
-    await msg.edit("⏳ Queued…")
+        msg = job["msg"]
+        inp = job["inp"]
+        out = inp.replace(".mp4", "_out.mp4")
 
-    jid = str(uuid.uuid4())[:8]
-    job_meta[jid] = meta
-    job_meta.pop(key, None)
+        await safe_edit(msg, ui("Compressing… Please wait", job["user"]))
 
-    task = asyncio.create_task(process_job(client, jid))
-    running_jobs[jid] = task
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", inp,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", str(job["crf"]),
+            "-maxrate", job["maxrate"],
+            "-bufsize", "2M",
+            "-c:a", "copy",
+            "-threads", "0",
+            "-movflags", "+faststart",
+            out
+        ]
 
-    await cq.answer("Queued ✔")
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        await app.send_video(
+            chat_id=job["chat"],
+            video=out,
+            caption=f"Compression completed.\n\nDev - {DEV_TAG}"
+        )
 
-# ------------------------
-# Run bot
-# ------------------------
+        os.remove(inp)
+        os.remove(out)
 
-if __name__ == "__main__":
-    print("🔥 Compressor Bot Running…")
-    bot.run()
+        await safe_edit(msg, ui("Done", job["user"]))
+
+    PROCESSING = False
+
+# ================= RUN =================
+app.run()
