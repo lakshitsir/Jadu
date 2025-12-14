@@ -1,146 +1,245 @@
 import os
 import asyncio
 import subprocess
-from collections import deque
-from pyrogram import Client, filters
+import time
+import shutil
+import uuid
 
-# ================= CONFIG =================
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+
+# -------------------------
+# YOUR CREDENTIALS
+# -------------------------
+
 API_ID = 12767104
 API_HASH = "a0ce1daccf78234927eb68a62f894b97"
 BOT_TOKEN = "8449049312:AAF48rvDz7tl2bK9dC7R63OSO6u4_xh-_t8"
 
-DEV_TAG = "@lakshitpatidar"
-
-WORKDIR = "work"
-os.makedirs(WORKDIR, exist_ok=True)
-
 app = Client(
-    "neo_compress_bot",
+    "neon_compressor_bot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
 
-# ================= UI =================
-def ui(status, user):
-    return (
-        "━━━━━━━━━━━━━━━━━━━\n"
-        "🎬 NEO VIDEO COMPRESSOR\n"
-        "━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Request by {user}\n\n"
-        f"{status}\n\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"Dev - {DEV_TAG}"
+BASE_TMP = "temp"
+os.makedirs(BASE_TMP, exist_ok=True)
+
+pending_files = {}
+queue = asyncio.Queue()
+processing = False
+
+# -------------------------
+# UI TEXTS (UNCHANGED)
+# -------------------------
+
+START_TEXT = """\
+🔮 𝗣𝗿𝗶𝘃𝗮𝘁𝗲 𝗛𝗤 𝗖𝗼𝗺𝗽𝗿𝗲𝘀𝘀𝗼𝗿 𝗦𝘆𝘀𝘁𝗲𝗺 ⚡
+
+Welcome to the Neon Compression Engine.
+Where heavy files transform into lightweight
+versions — without losing their soul.
+
+📥 Send any video/file to begin
+⚙️ Engine Mode: HEVC • 90% Same Quality
+🚀 Speed: Ultra Optimized
+🛡️ Privacy: Your files stay private
+📦 Output Size: Up to 10x Smaller
+
+👨‍💻 Developer – @lakshitpatidar
+"""
+
+START_BUTTONS = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔧 Start Compression", callback_data="compress_now")],
+    [InlineKeyboardButton("📚 Compression Modes", callback_data="modes")],
+    [InlineKeyboardButton("👨‍💻 Developer", url="https://t.me/lakshitpatidar")]
+])
+
+MODES_TEXT = """\
+🎚 **Compression Modes Available**
+
+🔹 **High Quality (Recommended)**
+• 90% Same Quality
+• 2GB → 200–400MB
+
+🔹 **Medium Quality**
+• 70–80% Quality
+
+🔹 **Low Quality**
+• 50–60% Quality
+
+(Current mode = High Quality HEVC)
+"""
+
+# -------------------------
+# PROGRESS BAR
+# -------------------------
+
+def progress_bar(percent):
+    filled = int(percent // 5)
+    empty = 20 - filled
+    return "▰" * filled + "▱" * empty
+
+
+async def get_duration(path):
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+    out = await proc.stdout.read()
+    return float(out.decode().strip())
+
+
+# -------------------------
+# COMPRESS (ANTI FREEZE)
+# -------------------------
+
+async def compress_video(input_path, output_path, quality, msg):
+
+    crf = {"high": "24", "medium": "28", "low": "32"}[quality]
+    total_dur = await get_duration(input_path)
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vcodec", "libx265",
+        "-crf", crf,
+        "-preset", "veryfast",
+        "-acodec", "aac",
+        "-b:a", "96k",
+        "-progress", "pipe:1",
+        output_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
     )
 
-# ================= SAFE EDIT =================
-LAST_EDIT = {}
-async def safe_edit(msg, text):
-    now = asyncio.get_event_loop().time()
-    mid = msg.id
-    if mid in LAST_EDIT and now - LAST_EDIT[mid] < 1.2:
-        await asyncio.sleep(1.2)
-    try:
-        await msg.edit(text)
-        LAST_EDIT[mid] = asyncio.get_event_loop().time()
-    except:
-        pass
+    last_edit = 0
 
-# ================= AUTO QUALITY =================
-def auto_params(size_mb: float):
-    if size_mb > 2000:
-        return 33, "1200k"
-    elif size_mb >= 1500:
-        return 32, "1400k"
-    elif size_mb >= 500:
-        return 30, "1800k"
-    elif size_mb >= 200:
-        return 28, "2200k"
-    else:
-        return 26, "2500k"
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
 
-# ================= QUEUE =================
-QUEUE = deque()
-PROCESSING = False
+        if b"out_time_ms=" in line:
+            now = time.time()
+            if now - last_edit < 1.5:
+                continue
 
-# ================= START =================
+            last_edit = now
+            try:
+                ms = int(line.decode().split("=")[1])
+                percent = min((ms / 1_000_000) / total_dur * 100, 100)
+                await msg.edit(
+                    f"⚙️ **Compressing… {percent:.1f}%**\n"
+                    f"`{progress_bar(percent)}`"
+                )
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except:
+                pass
+
+    await proc.wait()
+
+
+# -------------------------
+# QUEUE WORKER (HARD SAFE)
+# -------------------------
+
+async def worker():
+    global processing
+
+    while True:
+        user_id, message = await queue.get()
+        processing = True
+
+        data = pending_files[user_id]
+        job_dir = data["dir"]
+        input_path = data["input"]
+        quality = data["quality"]
+        output_path = os.path.join(job_dir, "compressed.mp4")
+
+        try:
+            progress = await message.reply("⚙️ **Starting compression…**")
+            await compress_video(input_path, output_path, quality, progress)
+
+            await progress.edit("📤 **Uploading file…**")
+            await message.reply_document(
+                output_path,
+                caption="🎥 **HQ Compressed File Ready!**"
+            )
+
+        finally:
+            # 🔥 HARD DELETE (NO TRACE LEFT)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            pending_files.pop(user_id, None)
+            queue.task_done()
+
+            if queue.empty():
+                processing = False
+
+
+# -------------------------
+# HANDLERS
+# -------------------------
+
 @app.on_message(filters.command("start"))
 async def start(_, m):
+    await m.reply(START_TEXT, reply_markup=START_BUTTONS)
+
+
+@app.on_message(filters.video | filters.document)
+async def handle_file(_, m):
+
+    job_id = uuid.uuid4().hex
+    job_dir = os.path.join(BASE_TMP, f"{m.from_user.id}_{job_id}")
+    os.makedirs(job_dir, exist_ok=True)
+
+    dl = await m.reply("📥 **Downloading your file…**")
+    input_path = await m.download(file_name=job_dir)
+    await dl.delete()
+
+    pending_files[m.from_user.id] = {
+        "input": input_path,
+        "dir": job_dir
+    }
+
     await m.reply(
-        "🎬 Neo Video Compressor\n\n"
-        "Send video → auto compress\n"
-        "Smart quality selection\n\n"
-        f"Dev - {DEV_TAG}"
+        "🎚 **Select Compression Quality:**",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔹 High Quality", callback_data="q_high")],
+            [InlineKeyboardButton("🔸 Medium Quality", callback_data="q_medium")],
+            [InlineKeyboardButton("⚡ Low Quality", callback_data="q_low")]
+        ])
     )
 
-# ================= VIDEO =================
-@app.on_message(filters.video)
-async def video_in(_, m):
-    global PROCESSING
 
-    user = f"@{m.from_user.username}" if m.from_user and m.from_user.username else "User"
-    status = await m.reply(ui("Added to queue…", user))
+@app.on_callback_query(filters.regex("q_"))
+async def select_quality(_, q):
+    quality = q.data.replace("q_", "")
+    pending_files[q.from_user.id]["quality"] = quality
 
-    inp = f"{WORKDIR}/{m.id}.mp4"
-    await m.download(file_name=inp)
+    await q.message.edit(
+        f"⏳ **Added to Queue**\n"
+        f"Quality: `{quality}`\n"
+        f"Waiting for your turn…"
+    )
 
-    size_mb = m.video.file_size / (1024 * 1024)
-    crf, maxrate = auto_params(size_mb)
+    await queue.put((q.from_user.id, q.message))
 
-    QUEUE.append({
-        "chat": m.chat.id,
-        "msg": status,
-        "inp": inp,
-        "user": user,
-        "crf": crf,
-        "maxrate": maxrate
-    })
+    global processing
+    if not processing:
+        asyncio.create_task(worker())
 
-    if not PROCESSING:
-        PROCESSING = True
-        asyncio.create_task(process_queue())
 
-# ================= PROCESS =================
-async def process_queue():
-    global PROCESSING
+# -------------------------
+# START BOT
+# -------------------------
 
-    while QUEUE:
-        job = QUEUE.popleft()
-
-        msg = job["msg"]
-        inp = job["inp"]
-        out = inp.replace(".mp4", "_out.mp4")
-
-        await safe_edit(msg, ui("Compressing… Please wait", job["user"]))
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", inp,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", str(job["crf"]),
-            "-maxrate", job["maxrate"],
-            "-bufsize", "2M",
-            "-c:a", "copy",
-            "-threads", "0",
-            "-movflags", "+faststart",
-            out
-        ]
-
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        await app.send_video(
-            chat_id=job["chat"],
-            video=out,
-            caption=f"Compression completed.\n\nDev - {DEV_TAG}"
-        )
-
-        os.remove(inp)
-        os.remove(out)
-
-        await safe_edit(msg, ui("Done", job["user"]))
-
-    PROCESSING = False
-
-# ================= RUN =================
+print("🔥 Neon Compressor Bot Started!")
 app.run()
